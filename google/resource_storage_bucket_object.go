@@ -131,7 +131,12 @@ func resourceStorageBucketObject() *schema.Resource {
 				DiffSuppressFunc: func(k, old, new string, d *schema.ResourceData) bool {
 					localMd5Hash := ""
 					if source, ok := d.GetOkExists("source"); ok {
-						localMd5Hash = getFileMd5Hash(source.(string))
+						prefix := "gs://"
+						if strings.HasPrefix(source.(string), prefix) {
+							localMd5Hash = getUriMd5Hash(d, meta, source.(string))
+						} else {
+							localMd5Hash = getFileMd5Hash(source.(string))
+						}
 					}
 
 					if content, ok := d.GetOkExists("content"); ok {
@@ -275,14 +280,31 @@ func resourceStorageBucketObjectCreate(d *schema.ResourceData, meta interface{})
 	bucket := d.Get("bucket").(string)
 	name := d.Get("name").(string)
 	var media io.Reader
+	var fromUri bool
+	var sourceBucket string
+	var sourceObject string
 
 	if v, ok := d.GetOk("source"); ok {
 		var err error
-		media, err = os.Open(v.(string))
-		if err != nil {
-			return err
+		prefix := "gs://"
+		if strings.HasPrefix(v.(string), prefix) {
+			fromUri = true
+			source := v.(string)[len(prefix):]
+			i := strings.IndexByte(source, '/')
+			if i == -1 {
+				return fmt.Errorf("Error, GCS URI %q%q: no object name", prefix, source)
+			}
+			sourceBucket = source[:i]
+			sourceObject = source[i+1:]
+		} else {
+			fromUri = false
+			media, err = os.Open(v.(string))
+			if err != nil {
+				return err
+			}
 		}
 	} else if v, ok := d.GetOk("content"); ok {
+		fromUri = false
 		media = bytes.NewReader([]byte(v.(string)))
 	} else {
 		return fmt.Errorf("Error, either \"content\" or \"source\" must be specified")
@@ -331,17 +353,33 @@ func resourceStorageBucketObjectCreate(d *schema.ResourceData, meta interface{})
 		object.TemporaryHold = v.(bool)
 	}
 
-	insertCall := objectsService.Insert(bucket, object)
-	insertCall.Name(name)
-	insertCall.Media(media)
+	var copyCall *storage.ObjectsCopyCall
+	var insertCall *storage.ObjectsInsertCall
+
+	if fromUri {
+		copyCall = objectsService.Copy(sourceBucket, sourceObject, bucket, name, object)
+
+	} else {
+		insertCall := objectsService.Insert(bucket, object)
+		insertCall.Name(name)
+		insertCall.Media(media)
+	}
 
 	// This is done late as we need to add headers to enable customer encryption
 	if v, ok := d.GetOk("customer_encryption"); ok {
 		customerEncryption := expandCustomerEncryption(v.([]interface{}))
-		setEncryptionHeaders(customerEncryption, insertCall.Header())
+		if fromUri {
+			setEncryptionHeaders(customerEncryption, copyCall.Header())
+		} else {
+			setEncryptionHeaders(customerEncryption, insertCall.Header())
+		}
 	}
 
-	_, err = insertCall.Do()
+	if fromUri {
+		_, err = copyCall.Do()
+	} else {
+		_, err = insertCall.Do()
+	}
 
 	if err != nil {
 		return fmt.Errorf("Error uploading object %s: %s", name, err)
@@ -511,6 +549,36 @@ func getFileMd5Hash(filename string) string {
 		return ""
 	}
 	return getContentMd5Hash(data)
+}
+
+func getUriMd5Hash(d *schema.ResourceData, meta interface{}, uri string) string {
+	config := meta.(*Config)
+	userAgent, err := generateUserAgentString(d, config.userAgent)
+	if err != nil {
+		log.Printf("[WARN] Failed to read source URI %q. Cannot compute md5 hash for it.", uri)
+		return ""
+	}
+	prefix := "gs://"
+	source := uri[len(prefix):]
+	i := strings.IndexByte(source, '/')
+	bucket := source[:i]
+	name := source[i+1:]
+
+	objectsService := storage.NewObjectsService(config.NewStorageClientWithTimeoutOverride(userAgent, d.Timeout(schema.TimeoutRead)))
+	getCall := objectsService.Get(bucket, name)
+
+	if v, ok := d.GetOk("customer_encryption"); ok {
+		customerEncryption := expandCustomerEncryption(v.([]interface{}))
+		setEncryptionHeaders(customerEncryption, getCall.Header())
+	}
+
+	res, err := getCall.Do()
+
+	if err != nil {
+		log.Printf("[WARN] Failed to read source URI %q. Cannot compute md5 hash for it.", uri)
+		return ""
+	}
+	return res.Md5Hash
 }
 
 func getContentMd5Hash(content []byte) string {
